@@ -47,12 +47,11 @@ Thumbs.db
 .envrc
 
 # Logs and outputs
-logs/
-output/
 *.log
 
 # Data folders (do not commit large data files)
-input/
+*.csv
+*.xlsx
 
 # Jupyter
 .ipynb_checkpoints/

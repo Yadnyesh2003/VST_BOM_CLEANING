@@ -1,4 +1,6 @@
 import pandas as pd
+import numpy as np
+import time
 from config import FILES, BOM_SCHEMA, TC_SCHEMA, IGNORE_SCHEMA, BOM_PARENT_CHILD_SCHEMA
 from loader import read_bom, read_csv
 from validator import validate_schema
@@ -14,7 +16,7 @@ log = logging.getLogger(__name__)
 
 # LOAD
 log.info("Starting BOM cleaning run")
-bom_df = read_bom(FILES["BOM"])
+bom_df = read_csv(FILES["BOM"])
 tc_df = read_csv(FILES["TC"])
 ig_df = read_csv(FILES["IGNORE"])
 vst_df = read_csv(FILES["BOM_PARENT_CHILD"])
@@ -36,188 +38,442 @@ validate_schema(vst_df, BOM_PARENT_CHILD_SCHEMA, "BOM_PARENT_CHILD")
 
 log.info("Schema validation complete")
 
+# Cleaning TC Master
+tc_df = tc_df[['ET code', 'Remark']].drop_duplicates().reset_index(drop=True)
+# Rename Remark column to avoid confusion during merge with Ignore Master
+tc_df = tc_df.rename(columns={'Remark': 'TC_Master_Remark'})
+
+# Cleaning Ignore Master
+ig_df = ig_df[['Unpainted parts', 'Remark']].drop_duplicates().reset_index(drop=True)
+# Rename Remark column to avoid confusion during merge with TC Master
+ig_df = ig_df.rename(columns={'Remark': 'Ignore_Master_Remark'})
+
+# Add original row number for traceability in error export
+bom_df["Original_Row_Number"] = range(1, len(bom_df) + 1)
+
 # Filter 1 - Remove child rows under the parent component with remark "Engine", "Transmission", "FRONT AXLE ASSY"
-log.info("Starting Filter 1: Remove child rows under parent component with remark 'Engine', 'Transmission', 'FRONT AXLE ASSY'")
+log.info("Starting Filter 1: Remove child rows under Engine / Transmission / Front Axle")
 
-bom_df = bom_df.merge(tc_df[['ET code', 'Remark']], left_on='Component', right_on='ET code', how='left')
-bom_df['Remark'] = bom_df['Remark'].fillna('No Remark').str.strip()
+bom_df = bom_df.merge(tc_df[['ET code', 'TC_Master_Remark']], left_on='Component', right_on='ET code', how='left')
 
-rows_to_delete = set()
+bom_df['TC_Master_Remark'] = bom_df['TC_Master_Remark'].fillna('No Remark').str.strip()
 
+target_remarks = {"Engine", "Transmission", "FRONT AXLE ASSY"}
 
-# remark_lookup = dict(zip(Tc['ET code'], Tc['Remark']))
+bom_df['is_parent'] = bom_df['TC_Master_Remark'].isin(target_remarks)
 
-# rows_to_delete = set()
-
-# for idx in range(len(df)):
-#     part = df.loc[idx, 'Component']
-
-#     if part in remark_lookup and remark_lookup[part] in ['Engine', 'Transmission', 'FRONT AXLE ASSY']:
-
-#         base_level = df.loc[idx, 'Level']
-
-#         # Start from next row (keep matched row)
-#         j = idx + 1
-
-#         while j < len(df):
-#             current_level = df.loc[j, 'Level']
-
-#             if current_level <= base_level:
-#                 break
-
-#             rows_to_delete.add(j)
-#             j += 1
-
-log.info("Filter 1: identified %d rows to remove", len(rows_to_delete))
-df_clean = df.drop(index=list(rows_to_delete)).reset_index(drop=True)
-log.info("After Filter 1 shape: %s", df_clean.shape)
-export_df(df_clean, "output/outputtest1.csv")
-log.info("Wrote intermediate output: output/outputtest1.csv")
+bom_df["Rejection Reason"] = ""
+bom_df["keep"] = True
 
 
-#Filter condition 2
-master_lookup = set(IG['Unpainted parts'].dropna())
+def filter_1_bom(group):
+    material, plant = group.name
+    log.info("Processing Material=%s | Plant=%s | Rows=%d",
+             material, plant,
+             len(group))
 
-rows_to_delete_2 = set()
+    active_parent_level = None
+    delete_mode = False
+    active_parent_component = None
 
-for idx in range(len(df_clean)):
+    for idx in group.index:
 
-    part = df_clean.loc[idx, 'Component']
+        row = bom_df.loc[idx]
+        lvl = row["Level"]
+        is_parent = row["is_parent"]
+        comp = row["Component"]
 
-    if part in master_lookup:
+        log.debug(
+            "Row idx=%s | Component=%s | Level=%s | is_parent=%s | delete_mode=%s",
+            idx, comp, lvl, is_parent, delete_mode
+        )
 
-        base_level = df_clean.loc[idx, 'Level']
+        # CASE 1: Parent found
+        if is_parent:
+            log.info("PARENT FOUND -> %s at level %s", comp, lvl)
 
-        rows_to_delete_2.add(idx)
+            active_parent_level = lvl
+            active_parent_component = comp
+            delete_mode = True
+            continue  # keep parent
 
-        j = idx + 1
-        while j < len(df_clean):
+        # CASE 2: Inside deletion window
+        if delete_mode:
+            if lvl > active_parent_level:
 
-            if df_clean.loc[j, 'Level'] <= base_level:
+                bom_df.at[idx, "keep"] = False
+                bom_df.at[idx, "Rejection Reason"] = (
+                    f"Child of {active_parent_component} (Level {active_parent_level})"
+                )
+
+                log.info(
+                    "DELETING -> %s | Reason: child of %s",
+                    comp, active_parent_component
+                )
+
+            else:
+                log.info(
+                    "EXIT DELETE MODE at %s (Level %s <= %s)",
+                    comp, lvl, active_parent_level
+                )
+
+                delete_mode = False
+                active_parent_level = None
+                active_parent_component = None
+
+bom_df.groupby(["Material", "Plant"], group_keys=False, sort=False).apply(filter_1_bom)
+
+df_rejected = bom_df[bom_df["keep"] == False].copy()
+df_clean = bom_df[bom_df["keep"] == True].copy()
+
+log.info("Total rejected rows: %d", len(df_rejected))
+log.info("Final clean dataset shape: %s", df_clean.shape)
+
+export_df(df_clean, "output/clean_bom_filter_1.csv")
+export_df(df_rejected, "output/rejected_bom_filter_1.csv")
+
+log.info("Exported clean_bom_filter_1.csv and rejected_bom_filter_1.csv")
+
+
+
+
+#######################################################################################################################################
+
+
+# Filter condition 2 - If parent in Ignore Master, then remove parent & child rows under that parent
+log.info("Starting Filter 2: If parent in Ignore Master, then remove parent & child rows under that parent")
+
+df_clean = df_clean.merge(ig_df[['Unpainted parts', 'Ignore_Master_Remark']], left_on='Component', right_on='Unpainted parts', how='left')
+df_clean['Ignore_Master_Remark'] = df_clean['Ignore_Master_Remark'].fillna('No Remark').str.strip()
+
+df_clean["is_ignore_parent"] = (
+    (df_clean["Ignore_Master_Remark"] == "Ignore")
+)
+
+def filter_2_bom(group):
+    material, plant = group.name
+    log.info("Processing Material=%s | Plant=%s | Rows=%d",
+             material, plant,
+             len(group))
+
+    active_parent_level = None
+    delete_mode = False
+    active_parent_component = None
+
+    for idx in group.index:
+
+        row = df_clean.loc[idx]
+        lvl = row["Level"]
+        is_parent = row["is_ignore_parent"]
+        comp = row["Component"]
+
+        # CASE 1: Parent found (IGNORE trigger)
+        if is_parent:
+
+            active_parent_level = lvl
+            active_parent_component = comp
+            delete_mode = True
+
+            # IMPORTANT: also delete parent itself
+            df_clean.at[idx, "keep"] = False
+            df_clean.at[idx, "Rejection Reason"] = "Ignore rule triggered"
+
+            continue
+
+        # CASE 2: delete children
+        if delete_mode:
+
+            if lvl > active_parent_level:
+
+                df_clean.at[idx, "keep"] = False
+                df_clean.at[idx, "Rejection Reason"] = (
+                    f"Child of Ignore parent {active_parent_component}"
+                )
+
+            else:
+                delete_mode = False
+                active_parent_level = None
+                active_parent_component = None
+
+
+df_clean.groupby(["Material", "Plant"], group_keys=False, sort=False).apply(filter_2_bom)
+
+df_rejected = df_clean[df_clean["keep"] == False].copy()
+df_clean = df_clean[df_clean["keep"] == True].copy()
+
+log.info("Total rejected rows: %d", len(df_rejected))
+log.info("Final clean dataset shape: %s", df_clean.shape)
+
+export_df(df_clean, "output/clean_bom_filter_2.csv")
+export_df(df_rejected, "output/rejected_bom_filter_2.csv")
+
+log.info("Exported clean_bom_filter_2.csv and rejected_bom_filter_2.csv")
+
+
+#####################################################################################################################
+
+# Filter 3 - Delete rows if Third Last Digit of Component is (1 or 9) AND Level != 1 AND Parent's Material Type != ZSFG
+
+def filter_3_bom(group):
+
+    for i in group.index:
+
+        row = group.loc[i]
+        comp = str(row["Component"])
+
+        lvl = row["Level"]
+
+        # Condition 1: Level != 1
+        if lvl == 1:
+            continue
+
+        # Condition 2: check 3rd last digit
+        if len(comp) < 3:
+            continue
+
+        third_last_digit = comp[-3]
+
+        # if comp == "BHG23A00021A0":
+        #     log.info("DEBUG: Component %s | 3rd last digit: %s", comp, third_last_digit)
+        #     # time.sleep(5)
+
+        if third_last_digit not in ["1", "9"]:
+            continue
+
+        # FIND PARENT
+        parent = None
+
+        for j in reversed(group.loc[:i-1].index):
+            if group.loc[j, "Level"] < lvl:
+                parent = group.loc[j]
                 break
 
-            rows_to_delete_2.add(j)
-            j += 1
+        # safety check
+        if parent is None:
+            continue
+
+        # Condition 3: parent material type check
+        if parent["Material type"] != "ZSFG":
+            df_clean.at[i, "keep"] = False
+            df_clean.at[i, "Rejection Reason"] = (
+                "3rd last digit rule + parent Material Type != ZSFG"
+            )
 
 
-# After Filter 2
-df_final = df_clean.drop(index=list(rows_to_delete_2)).reset_index(drop=True)
-log.info("Filter 2: removed %d rows", len(rows_to_delete_2))
-log.info("After Filter 2 shape: %s", df_final.shape)
-export_df(df_final, "output/outputfiltertest2.csv")
-log.info("Wrote intermediate output: output/outputfiltertest2.csv")
-# Parent lookup from vstparent&child file
-parent_lookup = dict(zip(vst_df['Child'], vst_df['Parent']))
+for (material, plant), group in df_clean.groupby(["Material", "Plant"], sort=False):
+    filter_3_bom(group)
 
-rows_to_delete_3 = set()
+df_rejected = df_clean[df_clean["keep"] == False].copy()
+df_clean = df_clean[df_clean["keep"] == True].copy()
 
-for idx in range(len(df_final)):
+log.info("Total rejected rows: %d", len(df_rejected))
+log.info("Final clean dataset shape: %s", df_clean.shape)
 
-    component = str(df_final.loc[idx, 'Component'])
+export_df(df_clean, "output/clean_bom_filter_3.csv")
+export_df(df_rejected, "output/rejected_bom_filter_3.csv")
 
-    # Check 3rd-last digit
-    if len(component) >= 3 and component[-3] in ['1', '9']:
+log.info("Exported clean_bom_filter_3.csv and rejected_bom_filter_3.csv")
 
-        # Find parent
-        if component in parent_lookup:
+missing_cols = [c for c in BOM_SCHEMA if c not in df_clean.columns]
 
-            parent = parent_lookup[component]
+if missing_cols:
+    raise ValueError(
+        f"Missing mandatory BOM columns before export: {missing_cols}"
+    )
 
-            # Search parent in File1
-            parent_rows = df_final[df_final['Component'] == parent]
+################################################################################################################################################################################################
 
-            if not parent_rows.empty:
+# Special Condition - Delete SubTrees of the BOM and keep leaf nodes only. As discovered on Friday 19th June.
 
-                parent_material_type = parent_rows.iloc[0]['Material type']
+# def filter_4_bom(group):
 
-                component_level = df_final.loc[idx, 'Level']
+#     group = group.sort_values("Original_Row_Number").copy()
 
-                if parent_material_type != 'ZSFG' and component_level != 1:
+#     i = 0
+#     n = len(group)
 
-                    # CURRENT REQUIREMENT
-                    # Delete only component row
-                    rows_to_delete_3.add(idx)
+#     while i < n:
 
-                    # --------------------------------------------------
-                    # FUTURE REQUIREMENT (currently disabled)
-                    # Uncomment if you want to delete component hierarchy
-                    # as well.
-                    #
-                    # base_level = component_level
-                    #
-                    # j = idx + 1
-                    #
-                    # while j < len(df_after_cond2):
-                    #
-                    #     if df_after_cond2.loc[j, 'L'] <= base_level:
-                    #         break
-                    #
-                    #     rows_to_delete_3.add(j)
-                    #     j += 1
-                    # --------------------------------------------------
-# After Filter 3
-log.info("Filter 3: identified %d rows to remove", len(rows_to_delete_3))
-df_filter3 = df_final.drop(index=list(rows_to_delete_3)).reset_index(drop=True)
-log.info("After Filter 3 shape: %s", df_filter3.shape)
-export_df(df_filter3, "output/outputfiltertest3.csv")
-log.info("Wrote intermediate output: output/outputfiltertest3.csv")
+#         # start new consecutive block
+#         block = [i]
 
-exceptions = {'Engine', 'Transmission', 'FRONT AXLE ASSY'}
+#         # build consecutive row-number block
+#         while i + 1 < n and \
+#               group.iloc[i + 1]["Original_Row_Number"] == group.iloc[i]["Original_Row_Number"] + 1:
+#             i += 1
+#             block.append(i)
 
-rows_to_delete_4 = set()
-tc_remark_lookup = dict(zip(
-    Tc['ET code'].astype(str).str.strip(),
-    Tc['Remark'].astype(str).str.strip()
-))
-#this peace of code not require remark in input
-for idx in range(len(df_filter3)):
+#         block_df = group.iloc[block]
 
-    material_type = str(df_filter3.loc[idx, 'Material type']).strip()
+#         # skip if already invalid rows only
+#         if len(block_df) == 0:
+#             i += 1
+#             continue
 
-    if material_type != 'ZSFG':
-        continue
+#         max_level = block_df["Level"].max()
 
-    material = str(df_filter3.loc[idx, 'Component']).strip()
+#         # leaf nodes = rows with max level in this block
+#         leaf_rows = block_df[block_df["Level"] == max_level].index
 
-    if material in tc_remark_lookup:
-        continue
-    else:
-        rows_to_delete_4.add(idx)
-#/  below code required remark column in input file
+#         # everything except leaf nodes becomes parent candidates
+#         for idx in block_df.index:
+
+#             if idx not in leaf_rows and group.at[idx, "keep"]:
+
+#                 group.at[idx, "keep"] = False
+#                 group.at[idx, "Rejection Reason"] = (
+#                     "Parent of leaf nodes in consecutive BOM chain"
+#                 )
+
+#         i += 1
+    
+#     return group
+
+def filter_4_bom(group):
+
+    group = group.sort_values("Original_Row_Number").copy()
+
+    n = len(group)
+
+    if (group['Component'] == "ACA02A00000A0").any():
+        log.info("Component ACA02A00000A0 found in group")
+        # log.info("DEBUG: Group data:\n%s", group)
+        # time.sleep(10)
+
+    # track parent nodes
+    has_child = set()
+
+    for i in range(n - 1):
+
+        current_level = group.iloc[i]["Level"]
+        next_level = group.iloc[i + 1]["Level"]
+
+        # if next node is deeper → current is parent
+        if next_level > current_level:
+            has_child.add(group.index[i])
+
+    # now delete all parents (keep only leaf nodes)
+    for idx in group.index:
+
+        if idx in has_child and group.at[idx, "keep"]:
+
+            group.at[idx, "keep"] = False
+            group.at[idx, "Rejection Reason"] = (
+                "Parent node in BOM subtree (leaf-only rule)"
+            )
+
+    return group
+
+for (material, plant), group in df_clean.groupby(["Material", "Plant"], sort=False):
+    # filter_4_bom(group)
+    updated_group = filter_4_bom(group)
+    df_clean.loc[updated_group.index, :] = updated_group
+
+# df_clean.groupby(
+#     ["Material", "Plant"],
+#     group_keys=False,
+#     sort=False
+# ).apply(filter_4_bom)
+
+df_rejected = df_clean[df_clean["keep"] == False].copy()
+df_clean = df_clean[df_clean["keep"] == True].copy()
+
+log.info("Total rejected rows: %d", len(df_rejected))
+log.info("Final clean dataset shape: %s", df_clean.shape)
+
+export_df(df_clean, "output/clean_bom_filter_4.csv")
+export_df(df_rejected, "output/rejected_bom_filter_4.csv")
+
+
+
+##########################################################################################################################################
+
+# Filter 5 - Delete rows where component = ZSFG but its TC_Master_Remark is not in target_remarks (Engine, Transmission, FRONT AXLE ASSY)
+
+for (material, plant), group in df_clean.groupby(["Material", "Plant"], sort=False):
+
+    for idx in group.index:
+
+        row = group.loc[idx]
+        material_type = row["Material type"]
+        is_parent = row["is_parent"]
+        tc_master_remark = row["TC_Master_Remark"]
+        component = row["Component"]
+
+        if material_type == "ZSFG" and is_parent == False:
+            df_clean.at[idx, "keep"] = False
+            df_clean.at[idx, "Rejection Reason"] = (
+                f"Material type of {component} is ZSFG with TC Master Remark not in {target_remarks}"
+            )
+
+df_rejected = df_clean[df_clean["keep"] == False].copy()
+df_clean = df_clean[df_clean["keep"] == True].copy()
+
+log.info("Total rejected rows: %d", len(df_rejected))
+log.info("Final clean dataset shape: %s", df_clean.shape)
+
+export_df(df_clean, "output/clean_bom_filter_5.csv")
+export_df(df_rejected, "output/rejected_bom_filter_5.csv")
+
+
+
+
+# exceptions = {'Engine', 'Transmission', 'FRONT AXLE ASSY'}
+
+# rows_to_delete_4 = set()
+# tc_remark_lookup = dict(zip(
+#     Tc['ET code'].astype(str).str.strip(),
+#     Tc['Remark'].astype(str).str.strip()
+# ))
+# #this peace of code not require remark in input
 # for idx in range(len(df_filter3)):
 
-#     material_type = str(df_filter3.loc[idx, 'Material type']).strip().upper()
+#     material_type = str(df_filter3.loc[idx, 'Material type']).strip()
 
 #     if material_type != 'ZSFG':
 #         continue
 
-#     et_match = str(df_filter3.loc[idx, 'ET Match']).strip()
+#     material = str(df_filter3.loc[idx, 'Component']).strip()
 
-#     if et_match not in exceptions:
+#     if material in tc_remark_lookup:
+#         continue
+#     else:
 #         rows_to_delete_4.add(idx)
+# #/  below code required remark column in input file
+# # for idx in range(len(df_filter3)):
+
+# #     material_type = str(df_filter3.loc[idx, 'Material type']).strip().upper()
+
+# #     if material_type != 'ZSFG':
+# #         continue
+
+# #     et_match = str(df_filter3.loc[idx, 'ET Match']).strip()
+
+# #     if et_match not in exceptions:
+# #         rows_to_delete_4.add(idx)
 
 
-# After Filter 4
-log.info("Filter 4: identified %d rows to remove", len(rows_to_delete_4))
-df_after_cond4 = (
-    df_filter3
-    .drop(index=list(rows_to_delete_4))
-    .reset_index(drop=True)
-)
+# # After Filter 4
+# log.info("Filter 4: identified %d rows to remove", len(rows_to_delete_4))
+# df_after_cond4 = (
+#     df_filter3
+#     .drop(index=list(rows_to_delete_4))
+#     .reset_index(drop=True)
+# )
 
-log.info("After Filter 4 shape: %s", df_after_cond4.shape)
-export_df(df_after_cond4, "output/outputfiltertest4.csv")
-log.info("Wrote intermediate output: output/outputfiltertest4.csv")
-#c
-agg_dict = {col: 'first' for col in df_after_cond4.columns}
+# log.info("After Filter 4 shape: %s", df_after_cond4.shape)
+# export_df(df_after_cond4, "output/outputfiltertest4.csv")
+# log.info("Wrote intermediate output: output/outputfiltertest4.csv")
+# #c
+# agg_dict = {col: 'first' for col in df_after_cond4.columns}
 
-agg_dict['Comp. Qty'] = 'sum'
+# agg_dict['Comp. Qty'] = 'sum'
 
-df_final_output = (
-    df_after_cond4
-    .groupby(['Plant','Material', 'Component'], as_index=False)
-    .agg(agg_dict)
-)
-log.info("Aggregation complete. Final output shape: %s", df_final_output.shape)
-export_df(df_final_output, 'output/final_BOM_output_filter.csv')
-log.info("Wrote final output: output/final_BOM_output_filter.csv")
+# df_final_output = (
+#     df_after_cond4
+#     .groupby(['Plant','Material', 'Component'], as_index=False)
+#     .agg(agg_dict)
+# )
+# log.info("Aggregation complete. Final output shape: %s", df_final_output.shape)
+# export_df(df_final_output, 'output/final_BOM_output_filter.csv')
+# log.info("Wrote final output: output/final_BOM_output_filter.csv")

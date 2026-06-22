@@ -20,7 +20,15 @@ def read_bom(path):
 
 def read_csv(path):
     logger.info("Reading CSV from %s", path)
+
     df = pd.read_csv(path)
+    
+    # Clean column names
     df.columns = df.columns.str.strip()
+    
+    # Clean string data (VERY important for merges)
+    for col in df.select_dtypes(include='object').columns:
+        df[col] = df[col].astype(str).str.strip()
+    
     logger.info("Loaded CSV with shape %s", df.shape)
     return df
