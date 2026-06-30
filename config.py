@@ -3,9 +3,9 @@ from pathlib import Path
 BASE_PATH = Path(r"D:\000 VDL TESTING WORK\vst_bom_cleaning_automation\input")
 
 FILES = {
-    "BOM": BASE_PATH / "BOM_20260616.csv",
-    "TC": BASE_PATH / "TC_Master.csv",
-    "IGNORE": BASE_PATH / "IgnoreMaster.csv",
+    "BOM": BASE_PATH / "BOM_20260629.csv",
+    "TC": BASE_PATH / "TC_Master_29062026.csv",
+    "IGNORE": BASE_PATH / "IgnoreMaster_29062026.csv",
     "BOM_PARENT_CHILD": BASE_PATH / "BOM_Parent_Child.csv"
 }
 

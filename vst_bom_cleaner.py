@@ -16,7 +16,7 @@ log = logging.getLogger(__name__)
 
 # LOAD
 log.info("Starting BOM cleaning run")
-bom_df = read_csv(FILES["BOM"])
+bom_df = read_bom(FILES["BOM"])
 tc_df = read_csv(FILES["TC"])
 ig_df = read_csv(FILES["IGNORE"])
 vst_df = read_csv(FILES["BOM_PARENT_CHILD"])
@@ -66,62 +66,174 @@ bom_df["Rejection Reason"] = ""
 bom_df["keep"] = True
 
 
-def filter_1_bom(group):
-    material, plant = group.name
-    log.info("Processing Material=%s | Plant=%s | Rows=%d",
-             material, plant,
-             len(group))
+# def filter_1_bom(group):
+#     material, plant = group.name
+#     log.info("Processing Material=%s | Plant=%s | Rows=%d",
+#              material, plant,
+#              len(group))
 
-    active_parent_level = None
-    delete_mode = False
-    active_parent_component = None
+#     active_parent_level = None
+#     delete_mode = False
+#     active_parent_component = None
 
-    for idx in group.index:
+#     for idx in group.index:
+
+#         row = bom_df.loc[idx]
+#         lvl = row["Level"]
+#         is_parent = row["is_parent"]
+#         comp = row["Component"]
+
+#         log.debug(
+#             "Row idx=%s | Component=%s | Level=%s | is_parent=%s | delete_mode=%s",
+#             idx, comp, lvl, is_parent, delete_mode
+#         )
+
+#         # CASE 1: Parent found
+#         if is_parent:
+#             log.info("PARENT FOUND -> %s at level %s", comp, lvl)
+
+#             active_parent_level = lvl
+#             active_parent_component = comp
+#             delete_mode = True
+#             continue  # keep parent
+
+#         # CASE 2: Inside deletion window
+#         if delete_mode:
+#             if lvl > active_parent_level:
+
+#                 bom_df.at[idx, "keep"] = False
+#                 bom_df.at[idx, "Rejection Reason"] = (
+#                     f"Child of {active_parent_component} (Level {active_parent_level})"
+#                 )
+
+#                 log.info(
+#                     "DELETING -> %s | Reason: child of %s",
+#                     comp, active_parent_component
+#                 )
+
+#             else:
+#                 log.info(
+#                     "EXIT DELETE MODE at %s (Level %s <= %s)",
+#                     comp, lvl, active_parent_level
+#                 )
+
+#                 delete_mode = False
+#                 active_parent_level = None
+#                 active_parent_component = None
+
+def filter_1_bom(group, material, plant):
+
+    log.info(
+        "Filter 1 | Material=%s | Plant=%s | Rows=%d",
+        material,
+        plant,
+        len(group)
+    )
+
+    idxs = group.index.tolist()
+
+    pos = 0
+
+    while pos < len(idxs):
+
+        idx = idxs[pos]
 
         row = bom_df.loc[idx]
-        lvl = row["Level"]
-        is_parent = row["is_parent"]
-        comp = row["Component"]
 
-        log.debug(
-            "Row idx=%s | Component=%s | Level=%s | is_parent=%s | delete_mode=%s",
-            idx, comp, lvl, is_parent, delete_mode
+        comp = row["Component"]
+        lvl = row["Level"]
+
+        if not row["is_parent"]:
+            pos += 1
+            continue
+
+        #################################################
+        # TC MATCH FOUND
+        #################################################
+
+        log.info(
+            "TC MATCH | Material=%s | Plant=%s | Row=%s | Component=%s | Level=%s",
+            material,
+            plant,
+            idx,
+            comp,
+            lvl
         )
 
-        # CASE 1: Parent found
-        if is_parent:
-            log.info("PARENT FOUND -> %s at level %s", comp, lvl)
+        parent_level = lvl
+        parent_comp = comp
 
-            active_parent_level = lvl
-            active_parent_component = comp
-            delete_mode = True
-            continue  # keep parent
+        deleted_count = 0
 
-        # CASE 2: Inside deletion window
-        if delete_mode:
-            if lvl > active_parent_level:
+        #################################################
+        # DELETE CHILDREN ONLY
+        #################################################
 
-                bom_df.at[idx, "keep"] = False
-                bom_df.at[idx, "Rejection Reason"] = (
-                    f"Child of {active_parent_component} (Level {active_parent_level})"
+        child_pos = pos + 1
+
+        while child_pos < len(idxs):
+
+            child_idx = idxs[child_pos]
+
+            child_comp = bom_df.at[child_idx, "Component"]
+            child_level = bom_df.at[child_idx, "Level"]
+
+            if child_level > parent_level:
+
+                bom_df.at[child_idx, "keep"] = False
+
+                bom_df.at[child_idx, "Rejection Reason"] = (
+                    f"Child of {parent_comp}"
                 )
 
-                log.info(
-                    "DELETING -> %s | Reason: child of %s",
-                    comp, active_parent_component
+                deleted_count += 1
+
+                log.debug(
+                    "DELETE CHILD | Parent=%s(Level=%s) -> Child=%s(Level=%s)",
+                    parent_comp,
+                    parent_level,
+                    child_comp,
+                    child_level
                 )
+
+                child_pos += 1
 
             else:
+
                 log.info(
-                    "EXIT DELETE MODE at %s (Level %s <= %s)",
-                    comp, lvl, active_parent_level
+                    "END SUBTREE | Parent=%s(Level=%s) | Stop at Component=%s(Level=%s)",
+                    parent_comp,
+                    parent_level,
+                    child_comp,
+                    child_level
                 )
 
-                delete_mode = False
-                active_parent_level = None
-                active_parent_component = None
+                break
 
-bom_df.groupby(["Material", "Plant"], group_keys=False, sort=False).apply(filter_1_bom)
+        if child_pos >= len(idxs):
+
+            log.info(
+                "END SUBTREE | Parent=%s(Level=%s) | Reached end of BOM",
+                parent_comp,
+                parent_level
+            )
+
+        log.info(
+            "CHILDREN REMOVED | Parent=%s | Deleted=%d",
+            parent_comp,
+            deleted_count
+        )
+
+        # Jump to next sibling
+        pos = child_pos
+
+# bom_df.groupby(["Material", "Plant"], group_keys=False, sort=False).apply(filter_1_bom)
+
+for (material, plant), group in bom_df.groupby(
+        ["Material", "Plant"],
+        sort=False):
+
+    filter_1_bom(group, material, plant)
 
 df_rejected = bom_df[bom_df["keep"] == False].copy()
 df_clean = bom_df[bom_df["keep"] == True].copy()
@@ -150,53 +262,171 @@ df_clean["is_ignore_parent"] = (
     (df_clean["Ignore_Master_Remark"] == "Ignore")
 )
 
-def filter_2_bom(group):
-    material, plant = group.name
-    log.info("Processing Material=%s | Plant=%s | Rows=%d",
-             material, plant,
-             len(group))
+# def filter_2_bom(group):
+#     material, plant = group.name
+#     log.info("Processing Material=%s | Plant=%s | Rows=%d",
+#              material, plant,
+#              len(group))
 
-    active_parent_level = None
-    delete_mode = False
-    active_parent_component = None
+#     active_parent_level = None
+#     delete_mode = False
+#     active_parent_component = None
 
-    for idx in group.index:
+#     for idx in group.index:
 
-        row = df_clean.loc[idx]
-        lvl = row["Level"]
-        is_parent = row["is_ignore_parent"]
-        comp = row["Component"]
+#         row = df_clean.loc[idx]
+#         lvl = row["Level"]
+#         is_parent = row["is_ignore_parent"]
+#         comp = row["Component"]
 
-        # CASE 1: Parent found (IGNORE trigger)
-        if is_parent:
+#         # CASE 1: Parent found (IGNORE trigger)
+#         if is_parent:
 
-            active_parent_level = lvl
-            active_parent_component = comp
-            delete_mode = True
+#             active_parent_level = lvl
+#             active_parent_component = comp
+#             delete_mode = True
 
-            # IMPORTANT: also delete parent itself
-            df_clean.at[idx, "keep"] = False
-            df_clean.at[idx, "Rejection Reason"] = "Ignore rule triggered"
+#             # IMPORTANT: also delete parent itself
+#             df_clean.at[idx, "keep"] = False
+#             df_clean.at[idx, "Rejection Reason"] = "Ignore rule triggered"
 
+#             continue
+
+#         # CASE 2: delete children
+#         if delete_mode:
+
+#             if lvl > active_parent_level:
+
+#                 df_clean.at[idx, "keep"] = False
+#                 df_clean.at[idx, "Rejection Reason"] = (
+#                     f"Child of Ignore parent {active_parent_component}"
+#                 )
+
+#             else:
+#                 delete_mode = False
+#                 active_parent_level = None
+#                 active_parent_component = None
+
+def filter_2_bom(group, material, plant):
+
+    # material, plant = group.name
+
+    # log.info(
+    #     "Filter 2 | Material=%s | Plant=%s | Rows=%d",
+    #     material,
+    #     plant,
+    #     len(group)
+    # )
+
+    idxs = group.index.tolist()
+
+    pos = 0
+
+    while pos < len(idxs):
+
+        idx = idxs[pos]
+
+        # Skip rows already deleted by previous subtree
+        if not df_clean.at[idx, "keep"]:
+            pos += 1
             continue
 
-        # CASE 2: delete children
-        if delete_mode:
+        row = df_clean.loc[idx]
 
-            if lvl > active_parent_level:
+        comp = row["Component"]
+        lvl = row["Level"]
 
-                df_clean.at[idx, "keep"] = False
-                df_clean.at[idx, "Rejection Reason"] = (
-                    f"Child of Ignore parent {active_parent_component}"
+        # Not an ignore component
+        if not row["is_ignore_parent"]:
+            pos += 1
+            continue
+
+        #################################################
+        # IGNORE MATCH FOUND
+        #################################################
+
+        log.info(
+            "IGNORE MATCH | Material=%s | Plant=%s | Row=%s | Component=%s | Level=%s",
+            material,
+            plant,
+            idx,
+            comp,
+            lvl
+        )
+
+        parent_level = lvl
+        parent_comp = comp
+
+        # Delete parent itself
+        df_clean.at[idx, "keep"] = False
+        df_clean.at[idx, "Rejection Reason"] = "Ignore rule triggered"
+
+        deleted_count = 1
+
+        #################################################
+        # DELETE SUBTREE
+        #################################################
+
+        child_pos = pos + 1
+
+        while child_pos < len(idxs):
+
+            child_idx = idxs[child_pos]
+
+            child_comp = df_clean.at[child_idx, "Component"]
+            child_level = df_clean.at[child_idx, "Level"]
+
+            # Still inside subtree
+            if child_level > parent_level:
+
+                df_clean.at[child_idx, "keep"] = False
+                df_clean.at[child_idx, "Rejection Reason"] = (
+                    f"Child of Ignore parent {parent_comp}"
                 )
 
+                deleted_count += 1
+
+                log.debug(
+                    "DELETE CHILD | Parent=%s(Level=%s) -> Child=%s(Level=%s) | Row=%s",
+                    parent_comp,
+                    parent_level,
+                    child_comp,
+                    child_level,
+                    child_idx
+                )
+
+                child_pos += 1
+
             else:
-                delete_mode = False
-                active_parent_level = None
-                active_parent_component = None
 
+                log.info(
+                    "END SUBTREE | Parent=%s(Level=%s) | Stop at Row=%s Component=%s Level=%s",
+                    parent_comp,
+                    parent_level,
+                    child_idx,
+                    child_comp,
+                    child_level
+                )
 
-df_clean.groupby(["Material", "Plant"], group_keys=False, sort=False).apply(filter_2_bom)
+                break
+
+        log.info(
+            "SUBTREE REMOVED | Parent=%s | Total Rows Deleted=%d",
+            parent_comp,
+            deleted_count
+        )
+
+        # Jump directly to next sibling/root row
+        pos = child_pos
+
+    # return group
+
+# df_clean.groupby(["Material", "Plant"], group_keys=False, sort=False).apply(filter_2_bom)
+for (material, plant), group in df_clean.groupby(
+        ["Material", "Plant"],
+        sort=False):
+
+    filter_2_bom(group, material, plant)
 
 df_rejected = df_clean[df_clean["keep"] == False].copy()
 df_clean = df_clean[df_clean["keep"] == True].copy()
@@ -335,8 +565,8 @@ def filter_4_bom(group):
 
     n = len(group)
 
-    if (group['Component'] == "ACA02A00000A0").any():
-        log.info("Component ACA02A00000A0 found in group")
+    # if (group['Component'] == "ACA02A00000A0").any():
+    #     log.info("Component ACA02A00000A0 found in group")
         # log.info("DEBUG: Group data:\n%s", group)
         # time.sleep(10)
 
@@ -364,10 +594,10 @@ def filter_4_bom(group):
 
     return group
 
-for (material, plant), group in df_clean.groupby(["Material", "Plant"], sort=False):
-    # filter_4_bom(group)
-    updated_group = filter_4_bom(group)
-    df_clean.loc[updated_group.index, :] = updated_group
+# for (material, plant), group in df_clean.groupby(["Material", "Plant"], sort=False):
+#     # filter_4_bom(group)
+#     updated_group = filter_4_bom(group)
+#     df_clean.loc[updated_group.index, :] = updated_group
 
 # df_clean.groupby(
 #     ["Material", "Plant"],
@@ -375,14 +605,14 @@ for (material, plant), group in df_clean.groupby(["Material", "Plant"], sort=Fal
 #     sort=False
 # ).apply(filter_4_bom)
 
-df_rejected = df_clean[df_clean["keep"] == False].copy()
-df_clean = df_clean[df_clean["keep"] == True].copy()
+# df_rejected = df_clean[df_clean["keep"] == False].copy()
+# df_clean = df_clean[df_clean["keep"] == True].copy()
 
-log.info("Total rejected rows: %d", len(df_rejected))
-log.info("Final clean dataset shape: %s", df_clean.shape)
+# log.info("Total rejected rows: %d", len(df_rejected))
+# log.info("Final clean dataset shape: %s", df_clean.shape)
 
-export_df(df_clean, "output/clean_bom_filter_4.csv")
-export_df(df_rejected, "output/rejected_bom_filter_4.csv")
+# export_df(df_clean, "output/clean_bom_filter_4.csv")
+# export_df(df_rejected, "output/rejected_bom_filter_4.csv")
 
 
 
@@ -414,6 +644,26 @@ log.info("Final clean dataset shape: %s", df_clean.shape)
 
 export_df(df_clean, "output/clean_bom_filter_5.csv")
 export_df(df_rejected, "output/rejected_bom_filter_5.csv")
+
+
+
+# Drop Duplicates by summing up component quantity and keeping the first occurrence of other columns
+final_dfs = []
+
+agg_dict = {col: "first" for col in df_clean.columns}
+agg_dict["Comp. Qty"] = "sum"
+
+df_final_output = (
+    df_clean
+    .groupby(["Plant", "Material", "Component"], as_index=False, sort=False)
+    .agg(agg_dict)
+)
+
+log.info("Final aggregation complete. Final output shape: %s", df_final_output.shape)
+
+export_df(df_final_output, "output/VST_Flat_BOM_Automation_Output.csv")
+
+
 
 
 
