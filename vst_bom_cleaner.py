@@ -446,6 +446,18 @@ log.info("Exported clean_bom_filter_2.csv and rejected_bom_filter_2.csv")
 
 def filter_3_bom(group):
 
+    material = group["Material"].iloc[0]
+    plant = group["Plant"].iloc[0]
+
+    log.info(
+        "Filter 3 | Material=%s | Plant=%s | Rows=%d",
+        material,
+        plant,
+        len(group)
+    )
+
+    rejected_count = 0
+
     for i in group.index:
 
         row = group.loc[i]
@@ -463,12 +475,18 @@ def filter_3_bom(group):
 
         third_last_digit = comp[-3]
 
-        # if comp == "BHG23A00021A0":
-        #     log.info("DEBUG: Component %s | 3rd last digit: %s", comp, third_last_digit)
-        #     # time.sleep(5)
-
         if third_last_digit not in ["1", "9"]:
             continue
+
+        log.info(
+            "DIGIT MATCH | Material=%s | Plant=%s | Row=%s | Component=%s | Level=%s | ThirdLastDigit=%s",
+            material,
+            plant,
+            i,
+            comp,
+            lvl,
+            third_last_digit
+        )
 
         # FIND PARENT
         parent = None
@@ -480,14 +498,44 @@ def filter_3_bom(group):
 
         # safety check
         if parent is None:
+
+            log.info(
+                "PARENT NOT FOUND | Component=%s | Level=%s",
+                comp,
+                lvl
+            )
+
             continue
 
         # Condition 3: parent material type check
         if parent["Material type"] != "ZSFG":
+
+            log.info(
+                "REJECTION MATCH | Component=%s | Parent Component=%s | Parent Material Type=%s",
+                comp,
+                parent["Component"],
+                parent["Material type"]
+            )
+
             df_clean.at[i, "keep"] = False
             df_clean.at[i, "Rejection Reason"] = (
                 "3rd last digit rule + parent Material Type != ZSFG"
             )
+
+            rejected_count += 1
+
+            log.debug(
+                "REJECT ROW | Component=%s | Level=%s",
+                comp,
+                lvl
+            )
+
+    log.info(
+        "FILTER 3 COMPLETE | Material=%s | Plant=%s | Rejected=%d",
+        material,
+        plant,
+        rejected_count
+    )
 
 
 for (material, plant), group in df_clean.groupby(["Material", "Plant"], sort=False):
@@ -620,7 +668,20 @@ def filter_4_bom(group):
 
 # Filter 5 - Delete rows where component = ZSFG but its TC_Master_Remark is not in target_remarks (Engine, Transmission, FRONT AXLE ASSY)
 
+log.info(
+    "Starting Filter 5 | Delete ZSFG components whose TC Master Remark is not in target remarks"
+)
+
 for (material, plant), group in df_clean.groupby(["Material", "Plant"], sort=False):
+
+    log.info(
+        "Filter 5 | Material=%s | Plant=%s | Rows=%d",
+        material,
+        plant,
+        len(group)
+    )
+
+    rejected_count = 0
 
     for idx in group.index:
 
@@ -631,10 +692,40 @@ for (material, plant), group in df_clean.groupby(["Material", "Plant"], sort=Fal
         component = row["Component"]
 
         if material_type == "ZSFG" and is_parent == False:
+
+            log.info(
+                "ZSFG MATCH | Material=%s | Plant=%s | Row=%s | Component=%s | TC_Master_Remark=%s",
+                material,
+                plant,
+                idx,
+                component,
+                tc_master_remark
+            )
+
             df_clean.at[idx, "keep"] = False
             df_clean.at[idx, "Rejection Reason"] = (
                 f"Material type of {component} is ZSFG with TC Master Remark not in {target_remarks}"
             )
+
+            rejected_count += 1
+
+            log.debug(
+                "DELETE ROW | Component=%s | Material Type=%s | TC_Master_Remark=%s",
+                component,
+                material_type,
+                tc_master_remark
+            )
+
+    log.info(
+        "GROUP COMPLETE | Material=%s | Plant=%s | Rejected=%d",
+        material,
+        plant,
+        rejected_count
+    )
+
+#################################################
+# FILTER 5 SUMMARY
+#################################################
 
 df_rejected = df_clean[df_clean["keep"] == False].copy()
 df_clean = df_clean[df_clean["keep"] == True].copy()
@@ -645,10 +736,17 @@ log.info("Final clean dataset shape: %s", df_clean.shape)
 export_df(df_clean, "output/clean_bom_filter_5.csv")
 export_df(df_rejected, "output/rejected_bom_filter_5.csv")
 
+log.info(
+    "Exported clean_bom_filter_5.csv and rejected_bom_filter_5.csv"
+)
 
+#################################################
+# FINAL AGGREGATION
+#################################################
 
-# Drop Duplicates by summing up component quantity and keeping the first occurrence of other columns
-final_dfs = []
+log.info(
+    "Starting final aggregation | Group By=(Plant, Material, Component)"
+)
 
 agg_dict = {col: "first" for col in df_clean.columns}
 agg_dict["Comp. Qty"] = "sum"
@@ -659,11 +757,17 @@ df_final_output = (
     .agg(agg_dict)
 )
 
-log.info("Final aggregation complete. Final output shape: %s", df_final_output.shape)
+log.info(
+    "Final aggregation complete | Output Rows=%d | Shape=%s",
+    len(df_final_output),
+    df_final_output.shape
+)
 
 export_df(df_final_output, "output/VST_Flat_BOM_Automation_Output.csv")
 
-
+log.info(
+    "Exported VST_Flat_BOM_Automation_Output.csv"
+)
 
 
 
